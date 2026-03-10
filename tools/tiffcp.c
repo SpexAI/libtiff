@@ -94,6 +94,8 @@ static int defpreset = -1;
 static int subcodec = -1;
 
 static int tiffcp(TIFF *, TIFF *);
+static int cpExif(TIFF *, TIFF *, tdir_t);
+static int cpExifTag(TIFF *, TIFF *, uint32_t);
 static int processCompressOptions(char *);
 static void usage(int code);
 
@@ -395,7 +397,8 @@ int main(int argc, char *argv[])
             tilewidth = deftilewidth;
             tilelength = deftilelength;
             g3opts = defg3opts;
-            if (!tiffcp(in, out) || !TIFFWriteDirectory(out))
+            if (!tiffcp(in, out) || !TIFFWriteDirectory(out) ||
+                !cpExif(in, out, TIFFCurrentDirectory(out)))
             {
                 (void)TIFFClose(in);
                 (void)TIFFClose(out);
@@ -711,6 +714,229 @@ static void usage(int code)
         if (TIFFGetField(in, tag, &v1, &v2, &v3, &v4))                         \
             TIFFSetField(out, tag, v1, v2, v3, v4);                            \
     } while (0)
+
+static int cpExif(TIFF *in, TIFF *out, tdir_t outdir)
+{
+    uint64_t exifoffset = 0;
+    uint64_t out_exif_offset = 0;
+    tdir_t indir = TIFFCurrentDirectory(in);
+    int tag_count = 0;
+    int tag_index = 0;
+
+    if (!TIFFGetField(in, TIFFTAG_EXIFIFD, &exifoffset))
+        return TRUE;
+    if (!TIFFReadEXIFDirectory(in, exifoffset))
+    {
+        TIFFError(TIFFFileName(in), "Failed to read EXIF directory at %" PRIu64,
+                  exifoffset);
+        return FALSE;
+    }
+    TIFFFreeDirectory(out);
+    if (TIFFCreateEXIFDirectory(out) != 0)
+    {
+        TIFFError(TIFFFileName(out), "Failed to create EXIF directory");
+        return FALSE;
+    }
+
+    tag_count = TIFFGetTagListCount(in);
+    for (tag_index = 0; tag_index < tag_count; ++tag_index)
+    {
+        if (!cpExifTag(in, out, TIFFGetTagListEntry(in, tag_index)))
+            return FALSE;
+    }
+
+    if (!TIFFWriteCustomDirectory(out, &out_exif_offset))
+    {
+        TIFFError(TIFFFileName(out), "Failed to write EXIF directory");
+        return FALSE;
+    }
+    if (!TIFFSetDirectory(out, outdir))
+    {
+        TIFFError(TIFFFileName(out),
+                  "Failed to reselect output directory %" PRIu32
+                  " after EXIF write",
+                  outdir);
+        return FALSE;
+    }
+    TIFFSetField(out, TIFFTAG_EXIFIFD, out_exif_offset);
+    if (!TIFFRewriteDirectory(out))
+    {
+        TIFFError(TIFFFileName(out),
+                  "Failed to rewrite output directory %" PRIu32
+                  " after EXIF write",
+                  outdir);
+        return FALSE;
+    }
+    if (!TIFFSetDirectory(in, indir))
+    {
+        TIFFError(TIFFFileName(in),
+                  "Failed to restore input directory %" PRIu32, indir);
+        return FALSE;
+    }
+    TIFFCreateDirectory(out);
+    return TRUE;
+}
+
+static int cpExifTag(TIFF *in, TIFF *out, uint32_t tag)
+{
+    const TIFFField *fip = TIFFFieldWithTag(in, tag);
+    int value_count = 0;
+
+    if (fip == NULL)
+        return TRUE;
+
+    if (TIFFFieldPassCount(fip))
+    {
+        void *raw_data = NULL;
+
+        if (TIFFFieldReadCount(fip) == TIFF_VARIABLE2)
+        {
+            uint32_t value_count = 0;
+
+            if (!TIFFGetField(in, tag, &value_count, &raw_data))
+                return TRUE;
+            return TIFFSetField(out, tag, value_count, raw_data);
+        }
+        else
+        {
+            uint16_t value_count = 0;
+
+            if (!TIFFGetField(in, tag, &value_count, &raw_data))
+                return TRUE;
+            return TIFFSetField(out, tag, value_count, raw_data);
+        }
+    }
+
+    value_count = TIFFFieldReadCount(fip);
+    if (value_count == TIFF_VARIABLE || value_count == TIFF_VARIABLE2)
+        value_count = 1;
+    else if (value_count == TIFF_SPP)
+    {
+        uint16_t samplesperpixel = 0;
+
+        TIFFGetFieldDefaulted(in, TIFFTAG_SAMPLESPERPIXEL, &samplesperpixel);
+        value_count = samplesperpixel;
+    }
+
+    if (TIFFFieldDataType(fip) == TIFF_ASCII)
+    {
+        char *raw_data = NULL;
+
+        if (!TIFFGetField(in, tag, &raw_data))
+            return TRUE;
+        return TIFFSetField(out, tag, raw_data);
+    }
+
+    if (value_count > 1)
+    {
+        void *raw_data = NULL;
+
+        if (!TIFFGetField(in, tag, &raw_data))
+            return TRUE;
+        return TIFFSetField(out, tag, raw_data);
+    }
+
+    switch (TIFFFieldDataType(fip))
+    {
+        case TIFF_BYTE:
+        case TIFF_UNDEFINED:
+        {
+            uint8_t value = 0;
+            if (!TIFFGetField(in, tag, &value))
+                return TRUE;
+            return TIFFSetField(out, tag, value);
+        }
+        case TIFF_SBYTE:
+        {
+            int8_t value = 0;
+            if (!TIFFGetField(in, tag, &value))
+                return TRUE;
+            return TIFFSetField(out, tag, value);
+        }
+        case TIFF_SHORT:
+        {
+            uint16_t value = 0;
+            if (!TIFFGetField(in, tag, &value))
+                return TRUE;
+            return TIFFSetField(out, tag, value);
+        }
+        case TIFF_SSHORT:
+        {
+            int16_t value = 0;
+            if (!TIFFGetField(in, tag, &value))
+                return TRUE;
+            return TIFFSetField(out, tag, value);
+        }
+        case TIFF_LONG:
+        case TIFF_IFD:
+        {
+            uint32_t value = 0;
+            if (!TIFFGetField(in, tag, &value))
+                return TRUE;
+            return TIFFSetField(out, tag, value);
+        }
+        case TIFF_SLONG:
+        {
+            int32_t value = 0;
+            if (!TIFFGetField(in, tag, &value))
+                return TRUE;
+            return TIFFSetField(out, tag, value);
+        }
+        case TIFF_LONG8:
+        case TIFF_IFD8:
+        {
+            uint64_t value = 0;
+            if (!TIFFGetField(in, tag, &value))
+                return TRUE;
+            return TIFFSetField(out, tag, value);
+        }
+        case TIFF_SLONG8:
+        {
+            int64_t value = 0;
+            if (!TIFFGetField(in, tag, &value))
+                return TRUE;
+            return TIFFSetField(out, tag, value);
+        }
+        case TIFF_RATIONAL:
+        case TIFF_SRATIONAL:
+            if (TIFFFieldSetGetSize(fip) == (int)sizeof(double))
+            {
+                double value = 0.0;
+                if (!TIFFGetField(in, tag, &value))
+                    return TRUE;
+                return TIFFSetField(out, tag, value);
+            }
+            else
+            {
+                float value = 0.0f;
+                if (!TIFFGetField(in, tag, &value))
+                    return TRUE;
+                return TIFFSetField(out, tag, value);
+            }
+        case TIFF_FLOAT:
+        {
+            float value = 0.0f;
+            if (!TIFFGetField(in, tag, &value))
+                return TRUE;
+            return TIFFSetField(out, tag, value);
+        }
+        case TIFF_DOUBLE:
+        {
+            double value = 0.0;
+            if (!TIFFGetField(in, tag, &value))
+                return TRUE;
+            return TIFFSetField(out, tag, value);
+        }
+        case TIFF_NOTYPE:
+        case TIFF_ASCII:
+        default:
+            break;
+    }
+
+    TIFFError(TIFFFileName(in), "EXIF tag %u has unsupported data type %u",
+              (unsigned)tag, (unsigned)TIFFFieldDataType(fip));
+    return TRUE;
+}
 
 static void cpTag(TIFF *in, TIFF *out, uint16_t tag, uint16_t count,
                   TIFFDataType type)
