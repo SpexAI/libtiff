@@ -96,6 +96,7 @@ static int subcodec = -1;
 static int tiffcp(TIFF *, TIFF *);
 static int cpExif(TIFF *, TIFF *, tdir_t);
 static int cpExifTag(TIFF *, TIFF *, uint32_t);
+static char *cpEncodeByteString(const uint8_t *, uint16_t);
 static int processCompressOptions(char *);
 static void usage(int code);
 
@@ -777,10 +778,116 @@ static int cpExif(TIFF *in, TIFF *out, tdir_t outdir)
     return TRUE;
 }
 
+static char *cpEncodeByteString(const uint8_t *raw_data, uint16_t value_count)
+{
+    tmsize_t encoded_size = 3;
+    char *encoded = NULL;
+    char *dst = NULL;
+    uint16_t i = 0;
+
+    for (i = 0; i < value_count; ++i)
+    {
+        const uint8_t value = raw_data[i];
+
+        if (isprint(value) && value != '\\' && value != '"')
+            encoded_size += 1;
+        else if (value == '\t' || value == '\b' || value == '\r' ||
+                 value == '\n' || value == '\v' || value == '\f' ||
+                 value == '\\' || value == '"')
+            encoded_size += 2;
+        else
+            encoded_size += 4;
+    }
+
+    encoded = (char *)limitMalloc(encoded_size);
+    if (encoded == NULL)
+        return NULL;
+
+    dst = encoded;
+    *dst++ = '"';
+    for (i = 0; i < value_count; ++i)
+    {
+        const uint8_t value = raw_data[i];
+
+        if (isprint(value) && value != '\\' && value != '"')
+        {
+            *dst++ = (char)value;
+            continue;
+        }
+
+        *dst++ = '\\';
+        switch (value)
+        {
+            case '\t':
+                *dst++ = 't';
+                break;
+            case '\b':
+                *dst++ = 'b';
+                break;
+            case '\r':
+                *dst++ = 'r';
+                break;
+            case '\n':
+                *dst++ = 'n';
+                break;
+            case '\v':
+                *dst++ = 'v';
+                break;
+            case '\f':
+                *dst++ = 'f';
+                break;
+            case '\\':
+                *dst++ = '\\';
+                break;
+            case '"':
+                *dst++ = '"';
+                break;
+            default:
+                *dst++ = (char)('0' + ((value >> 6) & 0x07));
+                *dst++ = (char)('0' + ((value >> 3) & 0x07));
+                *dst++ = (char)('0' + (value & 0x07));
+                break;
+        }
+    }
+    *dst++ = '"';
+    *dst = '\0';
+    return encoded;
+}
+
 static int cpExifTag(TIFF *in, TIFF *out, uint32_t tag)
 {
     const TIFFField *fip = TIFFFieldWithTag(in, tag);
     int value_count = 0;
+
+    if (tag == EXIFTAG_MAKERNOTE)
+    {
+        uint16_t maker_note_count = 0;
+        uint8_t *maker_note_data = NULL;
+        char *encoded_maker_note = NULL;
+
+        if (TIFFGetField(in, tag, &maker_note_count, &maker_note_data))
+            encoded_maker_note =
+                cpEncodeByteString(maker_note_data, maker_note_count);
+
+        if (encoded_maker_note != NULL)
+        {
+            TIFFWarning(TIFFFileName(in),
+                        "Skipping EXIF tag MakerNote (%u) because it might "
+                        "contain absolute file offsets. Encoded value "
+                        "(%u bytes): %s",
+                        (unsigned)tag, (unsigned)maker_note_count,
+                        encoded_maker_note);
+            _TIFFfree(encoded_maker_note);
+        }
+        else
+        {
+            TIFFWarning(TIFFFileName(in),
+                        "Skipping EXIF tag MakerNote (%u) because it might "
+                        "contain absolute file offsets",
+                        (unsigned)tag);
+        }
+        return TRUE;
+    }
 
     if (fip == NULL)
         return TRUE;
